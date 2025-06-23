@@ -1,16 +1,17 @@
-# dashboard_ai.py
-
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.ensemble import IsolationForest
 import xgboost as xgb
 
-# 1) DATA LOADING & CLEANING
+# Sidebar file uploader
+st.sidebar.header("Upload Data")
+uploaded_file = st.sidebar.file_uploader("Upload your power consumption CSV", type=["csv"])
+
+# Load and clean data
 @st.cache_data
-def load_data():
-    df = pd.read_csv('household_power_consumption.csv', sep=';', header=None)
-    # split the single column into proper fields
+def load_data(file):
+    df = pd.read_csv(file, sep=';', header=None)
     df = df[0].str.split(',', expand=True)
     df.columns = [
         'Date', 'Time',
@@ -18,32 +19,30 @@ def load_data():
         'Voltage', 'Global_intensity',
         'Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3'
     ]
-    df = df[df['Date'] != 'Date']  # drop header-rows
-    # parse datetime
-    df['Datetime'] = pd.to_datetime(
-        df['Date'] + ' ' + df['Time'],
-        format='%d/%m/%Y %H:%M:%S',
-        errors='coerce'
-    )
-    # convert measurement columns to numeric
-    numeric_cols = [
-        'Global_active_power', 'Global_reactive_power',
-        'Voltage', 'Global_intensity',
-        'Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3'
-    ]
-    for col in numeric_cols:
+    df = df[df['Date'] != 'Date']
+    df['Datetime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+    for col in [
+        'Global_active_power', 'Global_reactive_power', 'Voltage',
+        'Global_intensity', 'Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3'
+    ]:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.dropna(inplace=True)
-    # drop old text columns & set index
     df.drop(['Date', 'Time'], axis=1, inplace=True)
     df.set_index('Datetime', inplace=True)
     return df
 
-df = load_data()
-hourly = df.resample('H').mean(numeric_only=True)
-daily  = df.resample('D').sum(numeric_only=True)
+if uploaded_file:
+    df = load_data(uploaded_file)
+    st.success("✅ Data uploaded and loaded successfully.")
+else:
+    st.warning("Please upload a valid dataset to continue.")
+    st.stop()
 
-# 2) TRAIN AI MODELS
+# Resample data
+hourly = df.resample('H').mean(numeric_only=True)
+daily = df.resample('D').sum(numeric_only=True)
+
+# Train Forecasting model
 @st.cache_resource
 def train_forecast_model(hourly_df):
     hr = hourly_df.copy()
@@ -52,32 +51,28 @@ def train_forecast_model(hourly_df):
     hr['month'] = hr.index.month
     hr['target'] = hr['Global_active_power'].shift(-1)
     hr.dropna(inplace=True)
-    features = ['Global_active_power', 'hour', 'dayofweek', 'month']
-    X = hr[features]; y = hr['target']
-    split = int(len(hr) * 0.7)
+    X = hr[['Global_active_power', 'hour', 'dayofweek', 'month']]
+    y = hr['target']
     model = xgb.XGBRegressor(n_estimators=100, max_depth=5, verbosity=0)
-    model.fit(X.iloc[:split], y.iloc[:split])
+    model.fit(X, y)
     return model
 
 def generate_forecast(model, hourly_df, steps=24):
-    preds = []
-    last_val = hourly_df['Global_active_power'].iloc[-1]
+    forecast = []
+    prev = hourly_df['Global_active_power'].iloc[-1]
     last_time = hourly_df.index[-1]
     for i in range(steps):
         ts = last_time + pd.Timedelta(hours=i+1)
-        feat = pd.DataFrame({
-            'Global_active_power': [last_val],
+        X_pred = pd.DataFrame({
+            'Global_active_power': [prev],
             'hour': [ts.hour],
             'dayofweek': [ts.dayofweek],
             'month': [ts.month]
         })
-        pred = model.predict(feat)[0]
-        preds.append((ts, pred))
-        last_val = pred
-    return pd.Series(
-        [p for _, p in preds],
-        index=pd.DatetimeIndex([t for t, _ in preds])
-    )
+        pred = model.predict(X_pred)[0]
+        forecast.append((ts, pred))
+        prev = pred
+    return pd.Series([p for _, p in forecast], index=[t for t, _ in forecast])
 
 @st.cache_resource
 def train_anomaly_model(hourly_df):
@@ -85,92 +80,86 @@ def train_anomaly_model(hourly_df):
     iso.fit(hourly_df[['Global_active_power']])
     return iso
 
-# build models
+# Train and Predict
 forecast_model = train_forecast_model(hourly)
 forecast_series = generate_forecast(forecast_model, hourly)
 iso_model = train_anomaly_model(hourly)
 hourly['anomaly'] = iso_model.predict(hourly[['Global_active_power']]) == -1
 
-# 3) STREAMLIT UI
+# Dashboard Navigation
 st.title("🔌 WattsGuard AI Dashboard")
-
-nav = st.sidebar.radio("Navigation", [
+page = st.sidebar.radio("Navigate", [
     "Real-Time", "Daily Summary", "Forecast",
     "Profiling", "Weekly", "Anomalies",
     "Hourly Profile", "Goals"
 ])
 
-if nav == "Real-Time":
-    st.header("Real-Time (Last 24h)")
-    data = hourly['Global_active_power'][-24:]
+# Render Screens
+if page == "Real-Time":
+    st.header("Function 1: Real-Time Monitoring")
     fig, ax = plt.subplots()
-    ax.plot(data.index, data.values)
+    ax.plot(hourly[-24:].index, hourly['Global_active_power'][-24:])
     ax.set_ylabel("kW")
     st.pyplot(fig)
 
-elif nav == "Daily Summary":
-    st.header("Daily Usage Summary")
-    date = st.date_input("Select Date", df.index.date[-1])
-    day = hourly[hourly.index.date == date]['Global_active_power']
+elif page == "Daily Summary":
+    st.header("Function 2: Daily Usage Summary")
+    date = st.date_input("Select a date", df.index.date[-1])
+    daily_data = hourly[hourly.index.date == date]
     fig, ax = plt.subplots()
-    ax.plot(day.index, day.values, marker='o')
+    ax.plot(daily_data.index, daily_data['Global_active_power'], marker='o')
     ax.set_ylabel("kW")
     st.pyplot(fig)
 
-elif nav == "Forecast":
-    st.header("AI Forecast (Next 24h)")
+elif page == "Forecast":
+    st.header("Function 3: AI Forecast (Next 24h)")
     past = hourly['Global_active_power'][-48:]
     fig, ax = plt.subplots()
-    ax.plot(past.index, past.values, label='Past 48h')
-    ax.plot(forecast_series.index, forecast_series.values, label='Forecast')
+    ax.plot(past.index, past, label='Past')
+    ax.plot(forecast_series.index, forecast_series, label='Forecast')
+    ax.legend()
     ax.set_ylabel("kW")
-    ax.legend()
     st.pyplot(fig)
 
-elif nav == "Profiling":
-    st.header("Appliance Profiling")
-    data = hourly[['Sub_metering_1','Sub_metering_2','Sub_metering_3']][-24:]
+elif page == "Profiling":
+    st.header("Function 4: Appliance Profiling")
     fig, ax = plt.subplots()
-    for col in data.columns:
-        ax.plot(data.index, data[col], label=col)
-    ax.legend()
+    hourly[-24:][['Sub_metering_1', 'Sub_metering_2', 'Sub_metering_3']].plot(ax=ax)
+    ax.set_ylabel("Watt-hours")
     st.pyplot(fig)
 
-elif nav == "Weekly":
-    st.header("Weekly Consumption")
-    week = daily['Global_active_power'][-7:]
+elif page == "Weekly":
+    st.header("Function 5: Weekly Consumption")
     fig, ax = plt.subplots()
-    ax.bar(week.index, week.values)
+    daily[-7:]['Global_active_power'].plot(kind='bar', ax=ax)
     ax.set_ylabel("kWh")
     st.pyplot(fig)
 
-elif nav == "Anomalies":
-    st.header("Anomaly Detection")
+elif page == "Anomalies":
+    st.header("Function 6: Anomaly Detection")
     fig, ax = plt.subplots()
-    ax.plot(hourly.index, hourly['Global_active_power'], label='Usage')
-    ax.scatter(
-        hourly.index[hourly['anomaly']],
-        hourly['Global_active_power'][hourly['anomaly']],
-        color='red', s=10, label='Anomaly'
-    )
+    ax.plot(hourly.index, hourly['Global_active_power'], label="Usage")
+    ax.scatter(hourly[hourly['anomaly']].index,
+               hourly[hourly['anomaly']]['Global_active_power'],
+               color='red', s=15, label="Anomaly")
+    ax.set_ylabel("kW")
     ax.legend()
     st.pyplot(fig)
 
-elif nav == "Hourly Profile":
-    st.header("Hourly Usage Profile")
-    avg = df.groupby(df.index.hour)['Global_active_power'].mean()
+elif page == "Hourly Profile":
+    st.header("Function 7: Hourly Usage Profile")
+    hourly_avg = df.groupby(df.index.hour)['Global_active_power'].mean()
     fig, ax = plt.subplots()
-    ax.bar(avg.index, avg.values)
-    ax.set_xlabel("Hour")
+    hourly_avg.plot(kind='bar', ax=ax)
     ax.set_ylabel("kW")
     st.pyplot(fig)
 
-elif nav == "Goals":
-    st.header("Goals vs Actual")
-    goal = st.number_input("Daily kWh Goal", value=20.0)
+elif page == "Goals":
+    st.header("Function 8: Goals vs Actual")
+    goal = st.number_input("Set your daily goal (kWh)", value=20.0)
     last_week = daily['Global_active_power'][-7:]
     fig, ax = plt.subplots()
-    ax.plot(last_week.index, last_week.values, label='Actual')
-    ax.plot(last_week.index, [goal]*7, '--', label='Goal')
+    ax.plot(last_week.index, last_week.values, label="Actual")
+    ax.plot(last_week.index, [goal]*7, linestyle='--', label="Goal")
     ax.legend()
     st.pyplot(fig)
